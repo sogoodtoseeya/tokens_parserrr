@@ -1,0 +1,192 @@
+%%writefile parse_crypto.py
+
+#!/usr/bin/env python3
+
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import List, Dict, Optional
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
+
+BASE_URL = "https://etherscan.io"
+
+
+# ---------- утилиты ----------
+
+def read_html_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="cp1251", errors="ignore")
+
+
+def clean_price_to_float(text: str) -> Optional[float]:
+    if not text:
+        return None
+
+    allowed = set("0123456789.,")
+    filtered = "".join(ch for ch in text if ch in allowed)
+    if not filtered:
+        return None
+
+    filtered = filtered.replace(",", "")
+
+    try:
+        return float(filtered)
+    except ValueError:
+        return None
+
+
+def parse_tokens_from_html(html: str) -> List[Dict]:
+   
+    soup = BeautifulSoup(html, "lxml")
+
+    container = soup.find("div", id="ContentPlaceHolder1_tblErc20Tokens")
+    if not container:
+        return []
+
+    table = container.find("table")
+    if not table:
+        return []
+
+    tbody = table.find("tbody") or table
+    rows = tbody.find_all("tr")
+
+    tokens: List[Dict] = []
+
+    for row in rows:
+        cells = row.find_all("td")
+        # ожидаем минимум 4 колонки: #, Token, пустая, Price, ...
+        if len(cells) < 4:
+            continue
+
+        token_cell = cells[1]
+        price_cell = cells[3]
+
+        # ----- название + ссылка -----
+        link = token_cell.find("a")
+        if not link:
+            continue
+
+        # в твоём файле внутри ссылки есть div.hash-tag с названием
+        name_tag = link.find("div", class_="hash-tag")
+        if name_tag:
+            name = name_tag.get_text(" ", strip=True)
+        else:
+            name = link.get_text(" ", strip=True)
+
+        if not name:
+            continue
+
+        # тикер в скобках, в span рядом с названием
+        symbol_tag = link.find("span")
+        symbol = None
+        if symbol_tag:
+            sym_text = symbol_tag.get_text(strip=True)
+            # уберём круглые скобки, чтобы было просто USDT
+            symbol = sym_text.strip("()") if sym_text else None
+
+        href = link.get("href", "").strip()
+        if not href:
+            continue
+        url = urljoin(BASE_URL, href)
+
+        # сама цена лежит в div.d-inline внутри ячейки
+        price_div = price_cell.find("div", class_="d-inline") or price_cell
+        price_text = price_div.get_text(" ", strip=True)
+        price = clean_price_to_float(price_text)
+        if price is None:
+            continue
+
+        tokens.append(
+            {
+                "name": name,
+                "symbol": symbol,
+                "price_usd": price,
+                "url": url,
+            }
+        )
+
+    return tokens
+
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Парсер списка токенов с сохранённой страницы etherscan.io/tokens. "
+            "Извлекает название, цену в USD и ссылку на токен, сортирует по цене "
+            "и выводит N самых дорогих токенов."
+        )
+    )
+
+    parser.add_argument(
+        "html_path",
+        nargs="?",
+        default="tokens.html",
+        help="путь к сохранённому HTML-файлу (по умолчанию tokens.html)",
+    )
+
+    parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=10,
+        help="сколько самых дорогих токенов вывести (по умолчанию 10)",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="путь к JSON-файлу для сохранения результата (опционально)",
+    )
+
+    # parse_known_args — чтобы в Colab не ругался на лишние служебные аргументы
+    args, _ = parser.parse_known_args()
+
+    html_path = Path(args.html_path)
+    if not html_path.is_file():
+        raise SystemExit(f"Файл '{html_path}' не найден")
+
+    html = read_html_file(html_path)
+    tokens = parse_tokens_from_html(html)
+
+    if not tokens:
+        print("Не удалось найти токены в HTML-файле.")
+        return
+
+    # сортировка по цене по убыванию
+    tokens.sort(key=lambda t: t["price_usd"], reverse=True)
+
+    # ограничение по количеству
+    limit = args.limit if args.limit and args.limit > 0 else len(tokens)
+    tokens_to_show = tokens[:limit]
+
+    print(f"Найдено токенов всего: {len(tokens)}")
+    print(f"Выводим топ {len(tokens_to_show)} по цене (USD):\n")
+
+    for idx, token in enumerate(tokens_to_show, start=1):
+        name_part = token["name"]
+        if token["symbol"] and token["symbol"] not in token["name"]:
+            name_part += f" ({token['symbol']})"
+
+        url_part = f" — {token['url']}" if token["url"] else ""
+        print(f"{idx:2d}. {name_part}: ${token['price_usd']:.6f}{url_part}")
+
+    # сохранение в JSON при необходимости
+    if args.output:
+        out_path = Path(args.output)
+        out_path.write_text(
+            json.dumps(tokens_to_show, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"\nРезультат сохранён в файл {out_path}")
+
+
+if __name__ == "__main__":
+    main()
